@@ -1,0 +1,10 @@
+pydeseq2
+gseapy
+pandas
+openpyxl
+seaborn
+scikit-learn
+fastcluster
+jupyter
+ipywidgets
+jupytext

@@ -1,0 +1,38 @@
+{
+	"name": "myomics",
+	"build": {
+        "dockerfile": "Dockerfile"
+    },
+
+    "runArgs": ["--gpus", "all"],
+    "remoteUser": "vscode",
+
+    "initializeCommand": "bash .devcontainer/generate-host-key.sh",
+    "postStartCommand": "bash .devcontainer/setup-ssh.sh",
+    "appPort": ["127.0.0.1:2222:2222"],
+
+
+	// Configure tool-specific properties.
+	"customizations": {
+        // Configure the vscode.
+        "vscode": {
+            // Install the vscode extension.
+            "extensions": [
+                "ms-python.python",
+                "ms-python.vscode-pylance",
+                "ms-python.debugpy",
+                "ms-toolsai.jupyter",
+                "snakemake.snakemake-lang",
+                "shd101wyy.markdown-preview-enhanced",
+                "mechatroner.rainbow-csv"
+            ]
+        }
+        
+    },
+
+    // Mount the data directory in the container.
+    "mounts": [
+        "source=/home/ahmed/Data,target=/workspaces/MYOMICS/data,type=bind,consistency=cached",
+        "source=${localEnv:HOME}/.ssh/id_ed25519_myomics.pub,target=/tmp/id_ed25519_myomics.pub,type=bind,readonly"
+    ]
+}
