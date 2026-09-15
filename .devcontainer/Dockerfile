@@ -4,11 +4,6 @@ FROM python:3.14.7-trixie
 RUN apt-get update
 RUN apt-get install -y git sudo curl
 
-# # Harden sshd (key-only, non-root, port 2222) and generate container host keys
-# RUN apt-get install -y openssh-server
-# COPY sshd_config /etc/ssh/sshd_config.d/devcontainer.conf
-# RUN mkdir -p /run/sshd && ssh-keygen -A
-
 # Add user so we don't need to run VS Code as root
 ARG USERNAME=vscode
 ARG USER_UID=1000
