@@ -1,6 +1,9 @@
 # Data
 data/
 
+# Snakemake metadata (alignment/ and a future DROP project dir)
+.snakemake/
+
 # Byte-compiled / optimized / DLL files
 __pycache__/
 *.py[codz]

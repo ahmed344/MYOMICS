@@ -1,0 +1,27 @@
+# Snakemake 7.32 CLI profile for the DROP container (docker_drop.sh).
+# This is the professional stand-in for a bash launcher: shared flags live here,
+# scientific/runtime values stay in ../../config.yaml.
+#
+# Keep cores / mem_gb in sync with ../../config.yaml → resources.threads
+# and resources.scheduler_mem_gb (and with docker_drop.sh --cpus / --memory).
+#
+# Usage (inside the container):
+#   cd /workspace/alignment
+#   snakemake --profile profiles/drop            # index + align all samples
+#   snakemake --profile profiles/drop star_index
+#   snakemake --profile profiles/drop -n         # dry-run
+#   snakemake --profile profiles/drop -R star_index   # force rebuild index
+#
+# Extra CLI flags after --profile still override this file.
+# Requires a writable HOME (docker_drop.sh sets HOME=/tmp/myomics_home).
+
+cores: 16
+resources:
+  - mem_gb=180
+
+# HDD bind mounts can lag; wait before treating a missing BAM as a failed job.
+latency-wait: 60
+
+rerun-incomplete: true
+printshellcmds: true
+show-failed-logs: true

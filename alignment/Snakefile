@@ -1,0 +1,503 @@
+# MYOMICS STAR index + PE RNA-seq alignment
+#
+# Lives under alignment/ so DROP can own /workspace/config.yaml later.
+# Expects Snakemake 7.32.x as shipped in quay.io/biocontainers/drop:1.6.1.
+#
+# Run inside the DROP container (docker_drop.sh):
+#   cd /workspace/alignment
+#   snakemake --profile profiles/drop              # index + align
+#   snakemake --profile profiles/drop star_index
+#   snakemake --profile profiles/drop -n           # dry-run
+from __future__ import annotations
+
+import glob
+import os
+import shlex
+import shutil
+import subprocess
+import sys
+
+from snakemake.utils import min_version
+
+min_version("7.32.0")
+
+configfile: os.path.join(workflow.basedir, "config.yaml")
+
+shell.executable("/bin/bash")
+shell.prefix("set -euo pipefail; ")
+
+
+def gb_to_star_bytes(gigabytes: int) -> int:
+    """Convert a GB figure to the decimal-byte value STAR RAM flags expect.
+
+    Args:
+        gigabytes (int): Memory limit in GB (1000**3 bytes, matching the original scripts).
+
+    Returns:
+        int: Byte limit for ``--limitGenomeGenerateRAM`` / ``--limitBAMsortRAM``.
+    """
+    return int(gigabytes) * 1000 ** 3
+
+
+def star_cli_args(params: dict) -> str:
+    """Turn ``config['star']['align']`` into a STAR command-line fragment.
+
+    Args:
+        params (dict): Mapping of STAR flag names (no leading ``--``) to scalars or lists.
+
+    Returns:
+        str: Shell-quoted argument string, e.g. ``--twopassMode Basic --outSAMattributes NH HI``.
+    """
+    parts: list[str] = []
+    for key, value in params.items():
+        if value is None or value is False:
+            continue
+        parts.append(f"--{key}")
+        if value is True:
+            continue
+        if isinstance(value, (list, tuple)):
+            parts.extend(shlex.quote(str(item)) for item in value)
+        else:
+            parts.append(shlex.quote(str(value)))
+    return " ".join(parts)
+
+
+def resolve_star_index_dir(align_dir: str, configured: str) -> str:
+    """Return the STAR ``--genomeDir`` path.
+
+    Args:
+        align_dir (str): Directory that holds FASTA, GTF and (by default) the index.
+        configured (str): Explicit index directory from config, or empty for the default.
+
+    Returns:
+        str: Path to the STAR index directory.
+    """
+    if configured:
+        return configured
+    return os.path.join(align_dir, "STAR_index")
+
+
+def gencode_base_url(release: int, configured: str) -> str:
+    """Return the GENCODE download prefix for this release.
+
+    Args:
+        release (int): GENCODE release number.
+        configured (str): Explicit URL from config, or empty for the official FTP prefix.
+
+    Returns:
+        str: Base URL without a trailing slash.
+    """
+    if configured:
+        return configured.rstrip("/")
+    return (
+        "https://ftp.ebi.ac.uk/pub/databases/gencode/Gencode_human/"
+        f"release_{release}"
+    )
+
+
+def sjdb_overhang(read_length: int, configured: int | None) -> int:
+    """Return STAR ``--sjdbOverhang`` (read length minus one unless overridden).
+
+    Args:
+        read_length (int): Sequenced read length in bp.
+        configured (int | None): Explicit overhang from config, or ``None`` to use ``read_length - 1``.
+
+    Returns:
+        int: Splice-junction database overhang.
+    """
+    if configured is None or configured == "":
+        return int(read_length) - 1
+    return int(configured)
+
+
+def discover_samples(
+    fastq_dir: str,
+    r1_suffix: str,
+    r2_suffix: str,
+    skip_undetermined: bool,
+    configured_names: list,
+) -> list:
+    """Return paired-end sample names to align.
+
+    Args:
+        fastq_dir (str): Directory containing Illumina FASTQ files.
+        r1_suffix (str): R1 filename suffix, e.g. ``_R1_001.fastq.gz``.
+        r2_suffix (str): Matching R2 suffix.
+        skip_undetermined (bool): Drop names that start with ``Undetermined``.
+        configured_names (list): Explicit names from config; empty means auto-discover.
+
+    Returns:
+        list: Sorted sample names (R1 basename with ``r1_suffix`` removed).
+    """
+    if configured_names:
+        names = list(configured_names)
+    elif not os.path.isdir(fastq_dir):
+        print(
+            f"WARNING: FASTQ directory not found: {fastq_dir}. "
+            "Default target will only ensure the STAR index exists.",
+            file=sys.stderr,
+        )
+        return []
+    else:
+        pattern = os.path.join(fastq_dir, f"*{r1_suffix}")
+        names = [
+            os.path.basename(path)[: -len(r1_suffix)]
+            for path in glob.glob(pattern)
+        ]
+
+    if skip_undetermined:
+        names = [name for name in names if not name.startswith("Undetermined")]
+
+    names = sorted(set(names))
+    missing: list[str] = []
+    for name in names:
+        r1 = os.path.join(fastq_dir, f"{name}{r1_suffix}")
+        r2 = os.path.join(fastq_dir, f"{name}{r2_suffix}")
+        if not os.path.isfile(r1) or not os.path.isfile(r2):
+            missing.append(f"{name} (R1={r1} R2={r2})")
+    if missing:
+        raise SystemExit(
+            "Missing paired FASTQs for: " + "; ".join(missing)
+        )
+    if not names:
+        print(
+            f"WARNING: no samples found in {fastq_dir}. "
+            "Default target will only ensure the STAR index exists.",
+            file=sys.stderr,
+        )
+    return names
+
+
+def parse_star_final_log(path: str) -> dict:
+    """Extract input-read count and unique-map percent from a STAR Log.final.out.
+
+    Args:
+        path (str): Path to ``Log.final.out``.
+
+    Returns:
+        dict: Keys ``input_reads`` (str) and ``uniquely_mapped_pct`` (str).
+    """
+    result = {"input_reads": "NA", "uniquely_mapped_pct": "NA"}
+    with open(path, encoding="utf-8") as handle:
+        for line in handle:
+            if "|" not in line:
+                continue
+            key, value = line.split("|", 1)
+            key = key.strip()
+            value = value.strip()
+            if key == "Number of input reads":
+                result["input_reads"] = value
+            elif key == "Uniquely mapped reads %":
+                result["uniquely_mapped_pct"] = value
+    return result
+
+
+def write_mapping_summary(log_paths: list, output_path: str) -> None:
+    """Write a TSV of STAR mapping rates and echo the same table to stdout.
+
+    Args:
+        log_paths (list): Paths to STAR ``Log.final.out`` files.
+        output_path (str): Destination TSV path.
+
+    Returns:
+        None
+    """
+    rows: list[tuple[str, str, str]] = []
+    for log_path in sorted(log_paths):
+        sample = os.path.basename(os.path.dirname(log_path))
+        parsed = parse_star_final_log(log_path)
+        rows.append((sample, parsed["input_reads"], parsed["uniquely_mapped_pct"]))
+
+    os.makedirs(os.path.dirname(output_path) or ".", exist_ok=True)
+    with open(output_path, "w", encoding="utf-8") as handle:
+        handle.write("sample\tinput_reads\tuniquely_mapped\n")
+        for row in rows:
+            handle.write("\t".join(row) + "\n")
+
+    print("=== mapping summary ===")
+    print(f"{'sample':<22} {'input_reads':>12} uniquely_mapped")
+    for sample, input_reads, uniq_pct in rows:
+        print(f"{sample:<22} {input_reads:>12} {uniq_pct}")
+
+
+def default_targets(wildcards) -> list:
+    """Return default DAG targets for ``rule all``.
+
+    Args:
+        wildcards: Snakemake wildcards (unused; required by the input-function API).
+
+    Returns:
+        list: FASTA index, STAR index marker, per-sample BAM indexes, and mapping summary.
+    """
+    del wildcards
+    targets = [FASTA_FAI, STAR_INDEX_MARKER]
+    if SAMPLES:
+        targets.extend(
+            expand(
+                os.path.join(OUT_DIR, "{sample}", "{sample}_Aligned.sortedByCoord.out.bam.bai"),
+                sample=SAMPLES,
+            )
+        )
+        targets.append(SUMMARY_TSV)
+    return targets
+
+
+# ---------------------------------------------------------------------------
+# Resolved config (paths are container paths from docker_drop.sh)
+# ---------------------------------------------------------------------------
+ALIGN_DIR = config["paths"]["align_dir"]
+STAR_DIR = resolve_star_index_dir(ALIGN_DIR, config["paths"].get("star_index_dir", ""))
+FASTQ_DIR = config["paths"]["fastq_dir"]
+OUT_DIR = config["paths"]["out_dir"]
+STAR_TMP_ROOT = config["paths"]["star_tmp_root"]
+
+THREADS = int(config["resources"]["threads"])
+INDEX_RAM_BYTES = gb_to_star_bytes(config["resources"]["star_index_ram_gb"])
+SORT_RAM_BYTES = gb_to_star_bytes(config["resources"]["star_bam_sort_ram_gb"])
+INDEX_MEM_GB = int(config["resources"]["star_index_ram_gb"])
+SORT_MEM_GB = int(config["resources"]["star_bam_sort_ram_gb"])
+
+RELEASE = int(config["reference"]["gencode_release"])
+FASTA_NAME = config["reference"]["fasta_filename"]
+GTF_NAME = config["reference"]["gtf_filename_template"].format(gencode_release=RELEASE)
+BASE_URL = gencode_base_url(RELEASE, config["reference"].get("base_url", ""))
+READ_LENGTH = int(config["reference"]["read_length"])
+SJDB_OVERHANG = sjdb_overhang(READ_LENGTH, config["reference"].get("sjdb_overhang"))
+
+R1_SUFFIX = config["samples"]["r1_suffix"]
+R2_SUFFIX = config["samples"]["r2_suffix"]
+SAMPLES = discover_samples(
+    FASTQ_DIR,
+    R1_SUFFIX,
+    R2_SUFFIX,
+    bool(config["samples"]["skip_undetermined"]),
+    list(config["samples"].get("names") or []),
+)
+STAR_ALIGN_EXTRA = star_cli_args(config["star"]["align"])
+
+FASTA = os.path.join(ALIGN_DIR, FASTA_NAME)
+FASTA_GZ = FASTA + ".gz"
+FASTA_FAI = FASTA + ".fai"
+GTF = os.path.join(ALIGN_DIR, GTF_NAME)
+GTF_GZ = GTF + ".gz"
+STAR_INDEX_MARKER = os.path.join(STAR_DIR, "genomeParameters.txt")
+SUMMARY_TSV = os.path.join(OUT_DIR, "mapping_summary.tsv")
+
+localrules: all, download_fasta, download_gtf, decompress_fasta, decompress_gtf, faidx_fasta, mapping_summary
+
+
+onstart:
+    missing = [exe for exe in ("STAR", "samtools", "wget", "gzip") if shutil.which(exe) is None]
+    if missing:
+        raise SystemExit(
+            "Missing on PATH: "
+            + ", ".join(missing)
+            + ". Start the DROP image with docker_drop.sh first."
+        )
+    star_version = subprocess.check_output(["STAR", "--version"], text=True).strip()
+    print(f"STAR {star_version}")
+    print(f"  index : {STAR_DIR}")
+    print(f"  FASTQ : {FASTQ_DIR}")
+    print(f"  out   : {OUT_DIR}")
+    print(f"  tmp   : {STAR_TMP_ROOT}")
+    print(f"  threads={THREADS}  samples={len(SAMPLES)}  sjdbOverhang={SJDB_OVERHANG}")
+
+
+rule all:
+    """Index (if needed), align every sample, index BAMs, write mapping_summary.tsv."""
+    input:
+        default_targets,
+
+
+rule download_fasta:
+    """Fetch the GENCODE primary-assembly FASTA (.gz), resumable via wget -c."""
+    output:
+        FASTA_GZ,
+    params:
+        url=f"{BASE_URL}/{FASTA_NAME}.gz",
+    log:
+        os.path.join(ALIGN_DIR, "logs", "download_fasta.log"),
+    shell:
+        """
+        mkdir -p "$(dirname {output:q})" "$(dirname {log:q})"
+        wget -c -O {output:q}.partial {params.url:q} > {log:q} 2>&1
+        mv {output:q}.partial {output:q}
+        """
+
+
+rule download_gtf:
+    """Fetch the GENCODE primary-assembly GTF (.gz), resumable via wget -c."""
+    output:
+        GTF_GZ,
+    params:
+        url=f"{BASE_URL}/{GTF_NAME}.gz",
+    log:
+        os.path.join(ALIGN_DIR, "logs", "download_gtf.log"),
+    shell:
+        """
+        mkdir -p "$(dirname {output:q})" "$(dirname {log:q})"
+        wget -c -O {output:q}.partial {params.url:q} > {log:q} 2>&1
+        mv {output:q}.partial {output:q}
+        """
+
+
+rule decompress_fasta:
+    """Keep the .gz and write an uncompressed FASTA beside it (STAR needs uncompressed)."""
+    input:
+        FASTA_GZ,
+    output:
+        FASTA,
+    log:
+        os.path.join(ALIGN_DIR, "logs", "decompress_fasta.log"),
+    shell:
+        "gzip -dc {input:q} > {output:q} 2> {log:q}"
+
+
+rule decompress_gtf:
+    """Keep the .gz and write an uncompressed GTF beside it."""
+    input:
+        GTF_GZ,
+    output:
+        GTF,
+    log:
+        os.path.join(ALIGN_DIR, "logs", "decompress_gtf.log"),
+    shell:
+        "gzip -dc {input:q} > {output:q} 2> {log:q}"
+
+
+rule faidx_fasta:
+    """samtools faidx for random access / DROP and IGV later; STAR does not consume this."""
+    input:
+        FASTA,
+    output:
+        FASTA_FAI,
+    log:
+        os.path.join(ALIGN_DIR, "logs", "faidx_fasta.log"),
+    shell:
+        "samtools faidx {input:q} > {log:q} 2>&1"
+
+
+rule star_index:
+    """Build the STAR genome index (skip if genomeParameters.txt already exists)."""
+    input:
+        fasta=FASTA,
+        gtf=GTF,
+    output:
+        marker=STAR_INDEX_MARKER,
+    params:
+        genome_dir=STAR_DIR,
+        overhang=SJDB_OVERHANG,
+        ram=INDEX_RAM_BYTES,
+    threads: THREADS
+    resources:
+        mem_gb=INDEX_MEM_GB,
+    log:
+        os.path.join(ALIGN_DIR, "logs", "star_index.log"),
+    shell:
+        """
+        mkdir -p "$(dirname {log:q})"
+        # A failed previous run can leave a half-written index; STAR needs an empty genomeDir.
+        if [[ ! -f {output.marker:q} ]]; then
+            rm -rf {params.genome_dir:q}
+        fi
+        mkdir -p {params.genome_dir:q}
+        echo "Building STAR index in {params.genome_dir} (~30-60 min, ~32 GB RAM typical, limit={params.ram})"
+        STAR \
+            --runMode genomeGenerate \
+            --runThreadN {threads} \
+            --genomeDir {params.genome_dir:q} \
+            --genomeFastaFiles {input.fasta:q} \
+            --sjdbGTFfile {input.gtf:q} \
+            --sjdbOverhang {params.overhang} \
+            --limitGenomeGenerateRAM {params.ram} \
+            > {log:q} 2>&1
+        grep -E 'sjdbOverhang|genomeFastaFiles|sjdbGTFfile|versionGenome' {output.marker:q} || true
+        """
+
+
+rule star_align:
+    """Align one 75 bp PE sample with ENCODE/DROP STAR flags from config.yaml."""
+    input:
+        r1=os.path.join(FASTQ_DIR, "{sample}" + R1_SUFFIX),
+        r2=os.path.join(FASTQ_DIR, "{sample}" + R2_SUFFIX),
+        index=STAR_INDEX_MARKER,
+    output:
+        bam=os.path.join(OUT_DIR, "{sample}", "{sample}_Aligned.sortedByCoord.out.bam"),
+        log_final=os.path.join(OUT_DIR, "{sample}", "{sample}_Log.final.out"),
+        gene_counts=os.path.join(OUT_DIR, "{sample}", "{sample}_ReadsPerGene.out.tab"),
+    params:
+        genome_dir=STAR_DIR,
+        tmp_root=STAR_TMP_ROOT,
+        tmp_dir=lambda wildcards: os.path.join(STAR_TMP_ROOT, wildcards.sample),
+        prefix=lambda wildcards: os.path.join(OUT_DIR, wildcards.sample, wildcards.sample + "_"),
+        legacy_tmp=lambda wildcards: os.path.join(
+            OUT_DIR, wildcards.sample, wildcards.sample + "__STARtmp"
+        ),
+        sort_ram=SORT_RAM_BYTES,
+        extra=STAR_ALIGN_EXTRA,
+    threads: THREADS
+    resources:
+        mem_gb=SORT_MEM_GB,
+    log:
+        os.path.join(OUT_DIR, "{sample}", "{sample}_snakemake.star.log"),
+    shell:
+        """
+        mkdir -p {params.tmp_root:q} "$(dirname {output.bam:q})"
+        fifo={params.tmp_root:q}/.fifo_test.$$
+        if ! mkfifo "$fifo" 2>/dev/null; then
+            echo "STAR temp dir does not support FIFOs: {params.tmp_root}" >&2
+            echo "Point paths.star_tmp_root at a Linux filesystem (e.g. /tmp)." >&2
+            exit 1
+        fi
+        rm -f "$fifo"
+
+        # STAR creates --outTmpDir; it must not already exist. Crash leftovers on
+        # the HDD sit next to the BAM as {{sample}}__STARtmp.
+        tmp_dir={params.tmp_dir:q}
+        rm -rf "$tmp_dir" {params.legacy_tmp:q}
+        trap 'rm -rf "$tmp_dir"' EXIT
+
+        echo "[align] {wildcards.sample}"
+        STAR \
+            --runThreadN {threads} \
+            --genomeDir {params.genome_dir:q} \
+            --readFilesIn {input.r1:q} {input.r2:q} \
+            --readFilesCommand zcat \
+            --outFileNamePrefix {params.prefix:q} \
+            --outTmpDir {params.tmp_dir:q} \
+            --outSAMtype BAM SortedByCoordinate \
+            --limitBAMsortRAM {params.sort_ram} \
+            {params.extra} \
+            > {log:q} 2>&1
+        """
+
+
+rule samtools_index:
+    """Index a coordinate-sorted BAM (separate rule so a missing BAI does not re-align)."""
+    input:
+        bam=os.path.join(OUT_DIR, "{sample}", "{sample}_Aligned.sortedByCoord.out.bam"),
+    output:
+        bai=os.path.join(OUT_DIR, "{sample}", "{sample}_Aligned.sortedByCoord.out.bam.bai"),
+    threads: THREADS
+    resources:
+        mem_gb=2,
+    log:
+        os.path.join(OUT_DIR, "{sample}", "{sample}_snakemake.samtools_index.log"),
+    shell:
+        "samtools index -@ {threads} {input.bam:q} {output.bai:q} > {log:q} 2>&1"
+
+
+rule mapping_summary:
+    """Collect STAR Log.final.out unique-map rates into mapping_summary.tsv."""
+    input:
+        logs=expand(
+            os.path.join(OUT_DIR, "{sample}", "{sample}_Log.final.out"),
+            sample=SAMPLES,
+        ),
+    output:
+        tsv=SUMMARY_TSV,
+    run:
+        logs = input.logs
+        if isinstance(logs, str):
+            logs = [logs]
+        write_mapping_summary(list(logs), output.tsv)

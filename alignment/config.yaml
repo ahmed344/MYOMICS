@@ -1,0 +1,180 @@
+# MYOMICS STAR alignment config (Snakemake 7)
+# ============================================================================
+# This is the alignment workflow config, NOT the DROP analysis config.yaml.
+# Keep it here under alignment/ so `drop init` can later create
+#   /workspace/config.yaml
+# without the two files overwriting each other.
+#
+# How to run (inside the DROP container from docker_drop.sh):
+#   cd /workspace/alignment
+#   snakemake --profile profiles/drop              # index + align
+#   snakemake --profile profiles/drop star_index
+#   snakemake --profile profiles/drop -n           # dry-run
+#
+# Edit the values below; do not hard-code paths in the Snakefile.
+# Runtime knobs (paths, threads, RAM) are separate from the STAR protocol
+# flags so you can change a machine setting without touching ENCODE defaults.
+# ============================================================================
+
+# ----------------------------------------------------------------------------
+# Paths (container paths from docker_drop.sh)
+#   /workspace          -> host repo
+#   /workspace/data_hdd -> host /home/ahmed/Data/HDD/Data/MYOMICS
+# Put large files on the HDD mount. STAR --outTmpDir cannot live there
+# (that filesystem does not support FIFOs); keep star_tmp_root on /tmp.
+# ----------------------------------------------------------------------------
+paths:
+  # GENCODE FASTA/GTF and the STAR genome index.
+  align_dir: /workspace/data_hdd/alignment/gencode_v50_GRCh38
+
+  # Created as {align_dir}/STAR_index unless you override this.
+  # Leave empty ("") to use the default.
+  star_index_dir: ""
+
+  # Illumina paired-end FASTQs (*_R1_001.fastq.gz + matching R2).
+  fastq_dir: /workspace/data_hdd/260630_MYOMICS-MO_Malfatti
+
+  # One subdirectory per sample: {out_dir}/{sample}/{sample}_Aligned.sortedByCoord.out.bam
+  out_dir: /workspace/data_hdd/alignment/star
+
+  # Scratch for STAR FIFOs. Must be a real Linux filesystem (ext4/xfs), not the HDD bind mount.
+  star_tmp_root: /tmp/myomics_star
+
+# ----------------------------------------------------------------------------
+# Sample selection
+# ----------------------------------------------------------------------------
+samples:
+  # Empty list = discover every *_R1_001.fastq.gz in paths.fastq_dir.
+  # Set an explicit list to align a subset (names without the R1 suffix):
+  #   names:
+  #     - Sample_S1_L001
+  names: []
+
+  r1_suffix: _R1_001.fastq.gz
+  r2_suffix: _R2_001.fastq.gz
+
+  # Lane leftovers from bcl2fastq / BCL Convert. Always skip if true.
+  skip_undetermined: true
+
+# ----------------------------------------------------------------------------
+# Compute (must fit the DROP container: --memory=200g --cpus=24)
+# STAR jobs request resources.threads cores and the RAM figures below.
+# Launch with --cores >= threads and --resources mem_gb=scheduler_mem_gb so
+# two STAR processes cannot start at once and OOM the container.
+# ----------------------------------------------------------------------------
+resources:
+  # Passed to STAR --runThreadN and samtools -@.
+  threads: 16
+
+  # Snakemake scheduler cap (GB). Keep this >= star_index_ram_gb.
+  scheduler_mem_gb: 180
+
+  # STAR --limitGenomeGenerateRAM (human GRCh38 index; abort if this is too low).
+  star_index_ram_gb: 180
+
+  # STAR --limitBAMsortRAM. Coordinate-sorted BAM is written in one pass.
+  star_bam_sort_ram_gb: 100
+
+# ----------------------------------------------------------------------------
+# Reference (GENCODE human)
+# Changing gencode_release or read_length requires rebuilding the STAR index
+# (delete {star_index_dir} or run: snakemake -R star_index).
+# ----------------------------------------------------------------------------
+reference:
+  gencode_release: 50
+
+  # Official GENCODE naming. FASTA is assembly-specific; GTF name is built as
+  #   gencode.v{gencode_release}.primary_assembly.annotation.gtf
+  fasta_filename: GRCh38.primary_assembly.genome.fa
+  gtf_filename_template: "gencode.v{gencode_release}.primary_assembly.annotation.gtf"
+
+  # Empty = https://ftp.ebi.ac.uk/pub/databases/gencode/Gencode_human/release_{gencode_release}
+  base_url: ""
+
+  # 75 bp PE RNA-seq. sjdbOverhang must be read_length - 1.
+  read_length: 75
+
+  # Empty/null = read_length - 1. Set only if you know you need a different overhang.
+  sjdb_overhang: null
+
+# ----------------------------------------------------------------------------
+# STAR alignment protocol (ENCODE long RNA-seq / DROP-style)
+# These are scientific parameters, not machine knobs. Do not lower them to
+# "make it faster". Index-time flags live under reference/resources above.
+#
+# I/O flags (genomeDir, readFilesIn, outFileNamePrefix, outTmpDir, runThreadN,
+# readFilesCommand, outSAMtype, limitBAMsortRAM) are wired in the Snakefile
+# because they depend on paths and wildcards.
+#
+# Values here become: --<key> <value>  (lists are expanded as multiple tokens).
+# ----------------------------------------------------------------------------
+star:
+  align:
+    # Per-sample 2-pass: first pass discovers splice junctions, second pass
+    # remaps using those junctions plus the GTF SJDB. Improves novel-junction
+    # detection. "Basic" = this sample only (not a multi-sample 2-pass).
+    twopassMode: Basic
+
+    # Max loci a read may map to and still be reported. More than this → the
+    # read is treated as unmapped (too multi-mapping). 20 is the ENCODE default.
+    outFilterMultimapNmax: 20
+
+    # Minimum intron length (bp) STAR will call when splitting a read. Gaps
+    # shorter than this are not treated as spliced. 20 bp is ENCODE; it also
+    # allows unusually short / micro-introns.
+    alignIntronMin: 20
+
+    # Maximum intron length (bp). A split alignment that would require a larger
+    # gap is rejected. 1 Mb is ENCODE long RNA-seq; typical for human.
+    alignIntronMax: 1000000
+
+    # Maximum genomic distance between paired-end mates. Keep equal to
+    # alignIntronMax so a pair spanning a long intron is still concordant.
+    alignMatesGapMax: 1000000
+
+    # Minimum anchored bases on each side of a *novel* (not-in-GTF) splice
+    # junction. Lower → more spurious novel SJs; higher → more conservative.
+    # ENCODE uses 8.
+    alignSJoverhangMin: 8
+
+    # Same overhang, but for junctions already in the SJ database (from the
+    # GTF). Annotated junctions are trusted, so 1 bp is enough (ENCODE).
+    alignSJDBoverhangMin: 1
+
+    # After junction filtering, drop any alignment that uses a junction which
+    # did not pass (i.e. is absent from SJ.out.tab). Reduces spurious spliced
+    # alignments; ENCODE default.
+    outFilterType: BySJout
+
+    # Absolute mismatch cap per read/pair. Set very high so it never fires;
+    # the fraction cap below is the real filter (ENCODE pattern).
+    outFilterMismatchNmax: 999
+
+    # Real mismatch filter: max mismatches as a fraction of read length.
+    # 0.04 = 4% → 3 mismatches on a 75 bp read.
+    outFilterMismatchNoverReadLmax: 0.04
+
+    # Extra SAM/BAM tags written for each alignment (beyond the required ones).
+    outSAMattributes:
+      - NH  # number of reported alignments for this read (multimapper count)
+      - HI  # hit index among those alignments (1-based)
+      - AS  # local alignment score
+      - nM  # STAR mismatch count per pair (STAR-specific; not the same as NM)
+      - NM  # edit distance to the reference (standard SAM)
+      - MD  # mismatching positions/bases (downstream variant / QC tools)
+      - jM  # intron motif for each junction (STAR)
+      - jI  # intron start/end coordinates (STAR)
+      - XS  # splice-junction strand (some transcript tools expect this)
+    # Count reads per gene at align time using the GTF baked into the index.
+    # Writes {sample}_ReadsPerGene.out.tab (columns: unstranded, stranded-fwd,
+    # stranded-rev). Useful QC; DROP will typically recount from the BAM.
+    quantMode: GeneCounts
+
+    # Keep unmapped reads in the main BAM instead of a separate file, so QC
+    # and DROP see the full library in one place.
+    outSAMunmapped: Within
+
+    # MAPQ assigned to *uniquely* mapped reads. STAR's default unique MAPQ is
+    # 255, which several tools treat as "missing". 60 is the ENCODE /
+    # GATK-friendly value. Multimapper MAPQ is still computed by STAR.
+    outSAMmapqUnique: 60
