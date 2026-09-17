@@ -1,8 +1,17 @@
 # Data
 data/
+sample_annotation.tsv
 
 # Snakemake metadata (alignment/ and a future DROP project dir)
 .snakemake/
+
+# DROP 1.6.1 internals created by `drop init` inside the container.
+# Keep drop/config.yaml, drop/sample_annotation.tsv, drop/profiles/, drop/run.sh.
+drop/.drop/
+drop/.wBuild/
+drop/Scripts/
+drop/Snakefile
+drop/.snakemake/
 
 # Byte-compiled / optimized / DLL files
 __pycache__/

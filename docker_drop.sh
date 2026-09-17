@@ -1,10 +1,5 @@
 #!/usr/bin/env bash
 # Start an interactive DROP 1.6.1 container (STAR, samtools, Snakemake 7.32).
-#
-# Host /etc/passwd is mounted so the container user matches the host UID/name,
-# but /home/ahmed is not in the image. Snakemake then dies creating
-# ~/.cache/snakemake (PermissionError: /home/ahmed). Point HOME at /tmp.
-set -euo pipefail
 
 docker run --rm -it \
   --name myomics-drop \
@@ -15,6 +10,8 @@ docker run --rm -it \
   -e HOME=/tmp/myomics_home \
   -e XDG_CACHE_HOME=/tmp/myomics_home/.cache \
   -e XDG_CONFIG_HOME=/tmp/myomics_home/.config \
+  -e R_LIBS_USER=/tmp/myomics_home/R \
+  -e TMPDIR=/tmp/myomics_home/tmp \
   --memory=200g \
   --cpus=24 \
   -v /etc/passwd:/etc/passwd:ro \

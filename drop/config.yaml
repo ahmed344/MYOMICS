@@ -1,0 +1,104 @@
+# MYOMICS DROP 1.6.1 config (FRASER2 + OUTRIDER, no MAE)
+# ============================================================================
+# This is the DROP analysis config, not the STAR alignment config
+# (alignment/config.yaml).
+#
+# Paths are container paths from docker_drop.sh:
+#   /workspace          -> host repo
+#   /workspace/data_hdd -> host /home/ahmed/Data/HDD/Data/MYOMICS
+#
+# Large outputs (counts, FRASER/OUTRIDER objects, HTML) go on the HDD mount.
+# Snakefile / Scripts / .drop come from `drop init` inside the container
+# (see drop/run.sh). Do not run this on the host.
+#
+# How to run (inside the DROP container from docker_drop.sh):
+#   bash /workspace/drop/run.sh dryrun
+#   bash /workspace/drop/run.sh fraser      # aberrantSplicing / FRASER2
+#   bash /workspace/drop/run.sh outrider    # aberrantExpression / OUTRIDER
+#   bash /workspace/drop/run.sh all         # fraser then outrider
+# ============================================================================
+
+projectTitle: "MYOMICS muscle RNA outliers (FRASER2 + OUTRIDER)"
+root: /workspace/data_hdd/drop
+htmlOutputPath: /workspace/data_hdd/drop/html
+indexWithFolderName: true
+
+hpoFile: null
+sampleAnnotation: /workspace/drop/sample_annotation.tsv
+
+# GENCODE v50 primary assembly used for STAR. genomeAssembly must be hg38
+# (UCSC chr* names), not GRCh38 (NCBI names without chr).
+genomeAssembly: hg38
+genome: /workspace/data_hdd/alignment/gencode_v50_GRCh38/GRCh38.primary_assembly.genome.fa
+geneAnnotation:
+  gencode50: /workspace/data_hdd/alignment/gencode_v50_GRCh38/gencode.v50.primary_assembly.annotation.gtf
+
+exportCounts:
+  geneAnnotations:
+    - gencode50
+  excludeGroups: null
+
+aberrantExpression:
+  run: true
+  groups:
+    - muscle
+  fpkmCutoff: 1
+  implementation: autoencoder
+  padjCutoff: 0.05
+  zScoreCutoff: 0
+  genesToTest: null
+  maxTestedDimensionProportion: 3
+  yieldSize: 2000000
+  useOHTtoObtainQ: true
+
+aberrantSplicing:
+  run: true
+  groups:
+    - muscle
+  recount: false
+  longRead: false
+  keepNonStandardChrs: false
+  filter: true
+  minExpressionInOneSample: 20
+  quantileMinExpression: 10
+  minDeltaPsi: 0.05
+  implementation: PCA
+  padjCutoff: 0.1
+  maxTestedDimensionProportion: 6
+  genesToTest: null
+  useOHTtoObtainQ: true
+  FRASER_version: "FRASER2"
+  deltaPsiCutoff: 0.1
+  quantileForFiltering: 0.75
+
+mae:
+  run: false
+  groups: []
+  gatkIgnoreHeaderCheck: true
+  padjCutoff: 0.05
+  allelicRatioCutoff: 0.8
+  addAF: false
+  maxAF: 0.001
+  maxVarFreqCohort: 0.05
+  qcVcf: null
+  qcGroups: []
+  dnaRnaMatchCutoff: 0.85
+
+rnaVariantCalling:
+  run: false
+  groups: []
+  highQualityVCFs: []
+  dbSNP: ""
+  repeat_mask: ""
+  createSingleVCF: false
+  addAF: false
+  maxAF: 0.001
+  maxVarFreqCohort: 0.05
+  hcArgs: ""
+  minAlt: 3
+  yieldSize: 100000
+
+tools:
+  gatkCmd: gatk
+  bcftoolsCmd: bcftools
+  samtoolsCmd: samtools

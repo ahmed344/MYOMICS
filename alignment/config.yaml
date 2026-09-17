@@ -1,8 +1,8 @@
 # MYOMICS STAR alignment config (Snakemake 7)
 # ============================================================================
 # This is the alignment workflow config, NOT the DROP analysis config.yaml.
-# Keep it here under alignment/ so `drop init` can later create
-#   /workspace/config.yaml
+# Keep it here under alignment/ so DROP can own
+#   /workspace/drop/config.yaml
 # without the two files overwriting each other.
 #
 # How to run (inside the DROP container from docker_drop.sh):

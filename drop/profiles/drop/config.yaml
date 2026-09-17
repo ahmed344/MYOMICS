@@ -1,0 +1,31 @@
+# Snakemake 7.32 CLI profile for DROP 1.6.1 (docker_drop.sh).
+# Scientific parameters live in ../../config.yaml.
+#
+# Do not set a global mem_mb / mem_gb cap here. DROP jobs declare mem_mb
+# (FRASER split-count is only 3000 on paper); a scheduler cap based on
+# those values would over-schedule RAM. Cores alone keep about 5 FRASER
+# count jobs (3 threads) or 2 OUTRIDER count jobs (6 threads) inside the
+# 200 GB / 24 CPU container.
+#
+# Usage (inside the container):
+#   bash /workspace/drop/run.sh dryrun
+#   bash /workspace/drop/run.sh fraser
+#   bash /workspace/drop/run.sh outrider
+#   bash /workspace/drop/run.sh all
+#
+# Extra CLI flags after --profile still override this file.
+# Requires a writable HOME (docker_drop.sh sets HOME=/tmp/myomics_home).
+
+cores: 16
+
+# HDD bind mounts can lag; wait before treating a missing BAM as a failed job.
+latency-wait: 60
+
+rerun-incomplete: true
+printshellcmds: true
+show-failed-logs: true
+
+# DROP maintainers recommend mtime so wBuild script edits do not rebuild
+# already-finished counts after drop update.
+rerun-triggers:
+  - mtime
